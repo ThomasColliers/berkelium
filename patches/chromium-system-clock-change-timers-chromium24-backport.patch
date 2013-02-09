@@ -1,0 +1,1921 @@
+--- third_party/WebKit/Source/JavaScriptCore/JavaScriptCore.exp~	2012-12-13 07:06:35.109949206 -0600
++++ third_party/WebKit/Source/JavaScriptCore/JavaScriptCore.exp	2012-12-14 17:28:39.346932470 -0600
+@@ -435,6 +435,7 @@
+ __ZN3WTF23callOnMainThreadAndWaitEPFvPvES0_
+ __ZN3WTF23dayInMonthFromDayInYearEib
+ __ZN3WTF23waitForThreadCompletionEjPPv
++__ZN3WTF27monotonicallyIncreasingTimeEv
+ __ZN3WTF27releaseFastMallocFreeMemoryEv
+ __ZN3WTF28setMainThreadCallbacksPausedEb
+ __ZN3WTF29cryptographicallyRandomNumberEv
+--- third_party/WebKit/Source/JavaScriptCore/JavaScriptCore.vcproj/JavaScriptCore/JavaScriptCore.def~	2012-12-13 07:06:32.691949290 -0600
++++ third_party/WebKit/Source/JavaScriptCore/JavaScriptCore.vcproj/JavaScriptCore/JavaScriptCore.def	2012-12-14 17:28:39.346932470 -0600
+@@ -241,6 +241,7 @@
+     ?markChildren@JSWrapperObject@JSC@@EAEXAAVMarkStack@2@@Z
+     ?markChildren@ScopeChainNode@JSC@@UAEXAAVMarkStack@2@@Z
+     ?materializePropertyMap@Structure@JSC@@AAEXXZ
++    ?monotonicallyIncreasingTime@WTF@@YANXZ
+     ?monthFromDayInYear@WTF@@YAHH_N@Z
+     ?msToYear@WTF@@YAHN@Z
+     ?name@InternalFunction@JSC@@QAEABVUString@2@PAVExecState@2@@Z
+--- third_party/WebKit/Source/JavaScriptCore/wtf/CurrentTime.cpp~	2012-12-13 07:06:24.163949585 -0600
++++ third_party/WebKit/Source/JavaScriptCore/wtf/CurrentTime.cpp	2012-12-14 17:28:39.347932484 -0600
+@@ -33,7 +33,10 @@
+ #include "config.h"
+ #include "CurrentTime.h"
+ 
+-#if OS(WINDOWS)
++#if PLATFORM(MAC)
++#include <mach/mach_time.h>
++#include <sys/time.h>
++#elif OS(WINDOWS)
+ 
+ // Windows is first since we want to use hires timers, despite USE(CF)
+ // being defined.
+@@ -44,35 +47,54 @@
+ #include <stdint.h>
+ #include <time.h>
+ 
+-#if USE(QUERY_PERFORMANCE_COUNTER)
+-#if OS(WINCE)
+-extern "C" time_t mktime(struct tm *t);
+-#else
+-#include <sys/timeb.h>
+-#include <sys/types.h>
+-#endif
+-#endif
+-
+-#elif PLATFORM(GTK)
+-#include <glib.h>
+ #elif PLATFORM(WX)
+ #include <wx/datetime.h>
+-#elif PLATFORM(BREWMP)
+-#include <AEEStdLib.h>
++#elif PLATFORM(EFL)
++#include <Ecore.h>
+ #else
+ #include <sys/time.h>
+ #endif
+ 
++#if PLATFORM(GTK)
++#include <glib.h>
++#endif
++
++#if PLATFORM(QT)
++#include <QElapsedTimer>
++#endif
++
+ #if PLATFORM(CHROMIUM)
+ #error Chromium uses a different timer implementation
+ #endif
+-
+ namespace WTF {
+ 
+-const double msPerSecond = 1000.0;
+-
+ #if OS(WINDOWS)
+ 
++// Number of 100 nanosecond between January 1, 1601 and January 1, 1970.
++static const ULONGLONG epochBias = 116444736000000000ULL;
++static const double hundredsOfNanosecondsPerMillisecond = 10000;
++
++static double lowResUTCTime()
++{
++    FILETIME fileTime;
++
++#if OS(WINCE)
++    GetCurrentFT(&fileTime);
++#else
++    GetSystemTimeAsFileTime(&fileTime);
++#endif
++
++    // As per Windows documentation for FILETIME, copy the resulting FILETIME structure to a
++    // ULARGE_INTEGER structure using memcpy (using memcpy instead of direct assignment can
++    // prevent alignment faults on 64-bit Windows).
++
++    ULARGE_INTEGER dateTime;
++    memcpy(&dateTime, &fileTime, sizeof(dateTime));
++
++    // Windows file times are in 100s of nanoseconds.
++    return (dateTime.QuadPart - epochBias) / hundredsOfNanosecondsPerMillisecond;
++}
++
+ #if USE(QUERY_PERFORMANCE_COUNTER)
+ 
+ static LARGE_INTEGER qpcFrequency;
+@@ -121,28 +143,6 @@
+     return (1000.0 * qpc.QuadPart) / static_cast<double>(qpcFrequency.QuadPart);
+ }
+ 
+-static double lowResUTCTime()
+-{
+-#if OS(WINCE)
+-    SYSTEMTIME systemTime;
+-    GetSystemTime(&systemTime);
+-    struct tm tmtime;
+-    tmtime.tm_year = systemTime.wYear - 1900;
+-    tmtime.tm_mon = systemTime.wMonth - 1;
+-    tmtime.tm_mday = systemTime.wDay;
+-    tmtime.tm_wday = systemTime.wDayOfWeek;
+-    tmtime.tm_hour = systemTime.wHour;
+-    tmtime.tm_min = systemTime.wMinute;
+-    tmtime.tm_sec = systemTime.wSecond;
+-    time_t timet = mktime(&tmtime);
+-    return timet * msPerSecond + systemTime.wMilliseconds;
+-#else
+-    struct _timeb timebuffer;
+-    _ftime(&timebuffer);
+-    return timebuffer.time * msPerSecond + timebuffer.millitm;
+-#endif
+-}
+-
+ static bool qpcAvailable()
+ {
+     static bool available;
+@@ -201,36 +201,13 @@
+ 
+ #else
+ 
+-static double currentSystemTime()
+-{
+-    FILETIME ft;
+-    GetCurrentFT(&ft);
+-
+-    // As per Windows documentation for FILETIME, copy the resulting FILETIME structure to a
+-    // ULARGE_INTEGER structure using memcpy (using memcpy instead of direct assignment can
+-    // prevent alignment faults on 64-bit Windows).
+-
+-    ULARGE_INTEGER t;
+-    memcpy(&t, &ft, sizeof(t));
+-
+-    // Windows file times are in 100s of nanoseconds.
+-    // To convert to seconds, we have to divide by 10,000,000, which is more quickly
+-    // done by multiplying by 0.0000001.
+-
+-    // Between January 1, 1601 and January 1, 1970, there were 369 complete years,
+-    // of which 89 were leap years (1700, 1800, and 1900 were not leap years).
+-    // That is a total of 134774 days, which is 11644473600 seconds.
+-
+-    return t.QuadPart * 0.0000001 - 11644473600.0;
+-}
+-
+ double currentTime()
+ {
+     static bool init = false;
+     static double lastTime;
+     static DWORD lastTickCount;
+     if (!init) {
+-        lastTime = currentSystemTime();
++        lastTime = lowResUTCTime();
+         lastTickCount = GetTickCount();
+         init = true;
+         return lastTime;
+@@ -269,18 +246,21 @@
+     return (double)now.GetTicks() + (double)(now.GetMillisecond() / 1000.0);
+ }
+ 
+-#elif PLATFORM(BREWMP)
++#elif PLATFORM(EFL)
++
++double currentTime()
++{
++    return ecore_time_unix_get();
++}
++
++#elif OS(QNX)
+ 
+-// GETUTCSECONDS returns the number of seconds since 1980/01/06 00:00:00 UTC,
+-// and GETTIMEMS returns the number of milliseconds that have elapsed since the last
+-// occurrence of 00:00:00 local time.
+-// We can combine GETUTCSECONDS and GETTIMEMS to calculate the number of milliseconds
+-// since 1970/01/01 00:00:00 UTC.
+ double currentTime()
+ {
+-    // diffSeconds is the number of seconds from 1970/01/01 to 1980/01/06
+-    const unsigned diffSeconds = 315964800;
+-    return static_cast<double>(diffSeconds + GETUTCSECONDS() + ((GETTIMEMS() % 1000) / msPerSecond));
++    struct timespec time;
++    if (clock_gettime(CLOCK_REALTIME, &time))
++        CRASH();
++    return time.tv_sec + time.tv_nsec / 1.0e9;
+ }
+ 
+ #else
+@@ -293,5 +273,65 @@
+ }
+ 
+ #endif
++
++#if PLATFORM(MAC)
++
++double monotonicallyIncreasingTime()
++{
++    // Based on listing #2 from Apple QA 1398.
++    static mach_timebase_info_data_t timebaseInfo;
++    if (!timebaseInfo.denom) {
++        kern_return_t kr = mach_timebase_info(&timebaseInfo);
++        ASSERT_UNUSED(kr, kr == KERN_SUCCESS);
++    }
++    return (mach_absolute_time() * timebaseInfo.numer) / (1.0e9 * timebaseInfo.denom);
++}
++
++#elif PLATFORM(EFL)
++
++double monotonicallyIncreasingTime()
++{
++    return ecore_time_get();
++}
++
++#elif PLATFORM(GTK)
++
++double monotonicallyIncreasingTime()
++{
++    return static_cast<double>(g_get_monotonic_time() / 1000000.0);
++}
++
++#elif PLATFORM(QT)
++
++double monotonicallyIncreasingTime()
++{
++    ASSERT(QElapsedTimer::isMonotonic());
++    static QElapsedTimer timer;
++    return timer.nsecsElapsed() / 1.0e9;
++}
++
++#elif OS(QNX)
++
++double monotonicallyIncreasingTime()
++{
++    struct timespec time;
++    if (clock_gettime(CLOCK_MONOTONIC, &time))
++        CRASH();
++    return time.tv_sec + time.tv_nsec / 1.0e9;
++}
++
++#else
++
++double monotonicallyIncreasingTime()
++{
++    static double lastTime = 0;
++    double currentTimeNow = currentTime();
++    if (currentTimeNow < lastTime)
++        return lastTime;
++    lastTime = currentTimeNow;
++    return currentTimeNow;
++}
++
++#endif
+ 
+ } // namespace WTF
+--- third_party/WebKit/Source/JavaScriptCore/wtf/CurrentTime.h~	2012-12-13 07:06:21.954949660 -0600
++++ third_party/WebKit/Source/JavaScriptCore/wtf/CurrentTime.h	2012-12-14 17:28:39.347932484 -0600
+@@ -47,22 +47,13 @@
+     return currentTime() * 1000.0;
+ }
+ 
+-inline void getLocalTime(const time_t* localTime, struct tm* localTM)
+-{
+-#if COMPILER(MSVC7_OR_LOWER) || COMPILER(MINGW) || OS(WINCE)
+-    *localTM = *localtime(localTime);
+-#elif COMPILER(MSVC)
+-    localtime_s(localTM, localTime);
+-#else
+-    localtime_r(localTime, localTM);
+-#endif
+-}
++double monotonicallyIncreasingTime();
+ 
+ } // namespace WTF
+ 
+ using WTF::currentTime;
+ using WTF::currentTimeMS;
+-using WTF::getLocalTime;
++using WTF::monotonicallyIncreasingTime;
+ 
+ #endif // CurrentTime_h
+ 
+--- third_party/WebKit/Source/JavaScriptCore/wtf/DateMath.cpp~	2012-12-13 07:06:21.959949661 -0600
++++ third_party/WebKit/Source/JavaScriptCore/wtf/DateMath.cpp	2012-12-14 17:28:39.348932486 -0600
+@@ -137,6 +137,17 @@
+     {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335}
+ };
+ 
++static inline void getLocalTime(const time_t* localTime, struct tm* localTM)
++{
++#if COMPILER(MSVC7_OR_LOWER) || COMPILER(MINGW)
++    *localTM = *localtime(localTime);
++#elif COMPILER(MSVC)
++    localtime_s(localTM, localTime);
++#else
++    localtime_r(localTime, localTM);
++#endif
++}
++
+ static inline bool isLeapYear(int year)
+ {
+     if (year % 4 != 0)
+--- third_party/WebKit/Source/WebCore/html/FTPDirectoryDocument.cpp~	2012-12-13 07:09:09.084943875 -0600
++++ third_party/WebKit/Source/WebCore/html/FTPDirectoryDocument.cpp	2012-12-14 17:28:39.349932485 -0600
+@@ -177,6 +177,17 @@
+     return String::format("%.2f GB", static_cast<float>(bytes)/1000000000);
+ }
+ 
++static inline void getLocalTime(const time_t* localTime, struct tm* localTM)
++{
++#if COMPILER(MSVC7_OR_LOWER) || COMPILER(MINGW)
++    *localTM = *localtime(localTime);
++#elif COMPILER(MSVC)
++    localtime_s(localTM, localTime);
++#else
++    localtime_r(localTime, localTM);
++#endif
++}
++
+ static bool wasLastDayOfMonth(int year, int month, int day)
+ {
+     static int lastDays[] = { 31, 0, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+--- third_party/WebKit/Source/WebCore/platform/SharedTimer.h~	2012-12-13 07:09:01.455944139 -0600
++++ third_party/WebKit/Source/WebCore/platform/SharedTimer.h	2012-12-14 17:28:39.349932485 -0600
+@@ -41,9 +41,8 @@
+         virtual ~SharedTimer() {}
+         virtual void setFiredFunction(void (*)()) = 0;
+ 
+-        // The fire time is relative to the classic POSIX epoch of January 1, 1970,
+-        // as the result of currentTime() is.
+-        virtual void setFireTime(double) = 0;
++        // The fire interval is in seconds relative to the current monotonic clock time.
++        virtual void setFireInterval(double) = 0;
+         virtual void stop() = 0;
+     };
+ 
+@@ -51,7 +50,7 @@
+     // Implemented by port (since it provides the run loop for the main thread).
+     // FIXME: make ports implement MainThreadSharedTimer directly instead.
+     void setSharedTimerFiredFunction(void (*)());
+-    void setSharedTimerFireTime(double);
++    void setSharedTimerFireInterval(double);
+     void stopSharedTimer();
+ 
+     // Implementation of SharedTimer for the main thread.
+@@ -62,9 +61,9 @@
+             setSharedTimerFiredFunction(function);
+         }
+         
+-        virtual void setFireTime(double fireTime)
++        virtual void setFireInterval(double interval)
+         {
+-            setSharedTimerFireTime(fireTime);
++            setSharedTimerFireInterval(interval);
+         }
+         
+         virtual void stop()
+--- third_party/WebKit/Source/WebCore/platform/ThreadTimers.cpp~	2012-12-13 07:08:51.179944495 -0600
++++ third_party/WebKit/Source/WebCore/platform/ThreadTimers.cpp	2012-12-14 17:28:39.350932484 -0600
+@@ -31,6 +31,9 @@
+ #include "ThreadGlobalData.h"
+ #include "Timer.h"
+ #include <wtf/CurrentTime.h>
++#include <wtf/MainThread.h>
++
++using namespace std;
+ 
+ namespace WebCore {
+ 
+@@ -81,7 +84,7 @@
+     if (m_firingTimers || m_timerHeap.isEmpty())
+         m_sharedTimer->stop();
+     else
+-        m_sharedTimer->setFireTime(m_timerHeap.first()->m_nextFireTime);
++        m_sharedTimer->setFireInterval(max(m_timerHeap.first()->m_nextFireTime - monotonicallyIncreasingTime(), 0.0));
+ }
+ 
+ void ThreadTimers::sharedTimerFired()
+@@ -97,12 +100,13 @@
+         return;
+     m_firingTimers = true;
+ 
+-    double fireTime = currentTime();
++    double fireTime = monotonicallyIncreasingTime();
+     double timeToQuit = fireTime + maxDurationOfFiringTimers;
+ 
+     while (!m_timerHeap.isEmpty() && m_timerHeap.first()->m_nextFireTime <= fireTime) {
+         TimerBase* timer = m_timerHeap.first();
+         timer->m_nextFireTime = 0;
++        timer->m_unalignedNextFireTime = 0;
+         timer->heapDeleteMin();
+ 
+         double interval = timer->repeatInterval();
+@@ -112,7 +116,7 @@
+         timer->fired();
+ 
+         // Catch the case where the timer asked timers to fire in a nested event loop, or we are over time limit.
+-        if (!m_firingTimers || timeToQuit < currentTime())
++        if (!m_firingTimers || timeToQuit < monotonicallyIncreasingTime())
+             break;
+     }
+ 
+--- third_party/WebKit/Source/WebCore/platform/Timer.cpp~	2012-12-13 07:08:51.088944498 -0600
++++ third_party/WebKit/Source/WebCore/platform/Timer.cpp	2012-12-14 17:28:39.351932483 -0600
+@@ -41,6 +41,8 @@
+ 
+ namespace WebCore {
+ 
++class TimerHeapReference;
++
+ // Timers are stored in a heap data structure, used to implement a priority queue.
+ // This allows us to efficiently determine which timer needs to fire the soonest.
+ // Then we set a single shared system timer to fire at that time.
+@@ -53,115 +55,144 @@
+     return threadGlobalData().threadTimers().timerHeap();
+ }
+ 
+-// Class to represent elements in the heap when calling the standard library heap algorithms.
+-// Maintains the m_heapIndex value in the timers themselves, which allows us to do efficient
+-// modification of the heap.
+-class TimerHeapElement {
+-public:
+-    explicit TimerHeapElement(int i)
+-        : m_index(i)
+-        , m_timer(timerHeap()[m_index])
+-    { 
+-        checkConsistency(); 
+-    }
+-
+-    TimerHeapElement(const TimerHeapElement&);
+-    TimerHeapElement& operator=(const TimerHeapElement&);
+-
+-    TimerBase* timer() const { return m_timer; }
+-
+-    void checkConsistency() const
+-    {
+-        ASSERT(m_index >= 0);
+-        ASSERT(m_index < static_cast<int>(timerHeap().size()));
+-    }
++// ----------------
+ 
++class TimerHeapPointer {
++public:
++    TimerHeapPointer(TimerBase** pointer) : m_pointer(pointer) { }
++    TimerHeapReference operator*() const;
++    TimerBase* operator->() const { return *m_pointer; }
+ private:
+-    TimerHeapElement();
++    TimerBase** m_pointer;
++};
+ 
+-    int m_index;
+-    TimerBase* m_timer;
++class TimerHeapReference {
++public:
++    TimerHeapReference(TimerBase*& reference) : m_reference(reference) { }
++    operator TimerBase*() const { return m_reference; }
++    TimerHeapPointer operator&() const { return &m_reference; }
++    TimerHeapReference& operator=(TimerBase*);
++    TimerHeapReference& operator=(TimerHeapReference);
++private:
++    TimerBase*& m_reference;
+ };
+ 
+-inline TimerHeapElement::TimerHeapElement(const TimerHeapElement& o)
+-    : m_index(-1), m_timer(o.timer())
++inline TimerHeapReference TimerHeapPointer::operator*() const
+ {
++    return *m_pointer;
+ }
+ 
+-inline TimerHeapElement& TimerHeapElement::operator=(const TimerHeapElement& o)
++inline TimerHeapReference& TimerHeapReference::operator=(TimerBase* timer)
+ {
+-    TimerBase* t = o.timer();
+-    m_timer = t;
+-    if (m_index != -1) {
+-        checkConsistency();
+-        timerHeap()[m_index] = t;
+-        t->m_heapIndex = m_index;
+-    }
++    m_reference = timer;
++    Vector<TimerBase*>& heap = timerHeap();
++    if (&m_reference >= heap.data() && &m_reference < heap.data() + heap.size())
++        timer->m_heapIndex = &m_reference - heap.data();
+     return *this;
+ }
+ 
+-inline bool operator<(const TimerHeapElement& a, const TimerHeapElement& b)
++inline TimerHeapReference& TimerHeapReference::operator=(TimerHeapReference b)
+ {
+-    // The comparisons below are "backwards" because the heap puts the largest 
+-    // element first and we want the lowest time to be the first one in the heap.
+-    double aFireTime = a.timer()->m_nextFireTime;
+-    double bFireTime = b.timer()->m_nextFireTime;
+-    if (bFireTime != aFireTime)
+-        return bFireTime < aFireTime;
++    TimerBase* timer = b;
++    return *this = timer;
++}
+     
+-    // We need to look at the difference of the insertion orders instead of comparing the two 
+-    // outright in case of overflow. 
+-    unsigned difference = a.timer()->m_heapInsertionOrder - b.timer()->m_heapInsertionOrder;
+-    return difference < UINT_MAX / 2;
++inline void swap(TimerHeapReference a, TimerHeapReference b)
++{
++    TimerBase* timerA = a;
++    TimerBase* timerB = b;
++
++    // Invoke the assignment operator, since that takes care of updating m_heapIndex.
++    a = timerB;
++    b = timerA;
+ }
+ 
+ // ----------------
+ 
+ // Class to represent iterators in the heap when calling the standard library heap algorithms.
+-// Returns TimerHeapElement for elements in the heap rather than the TimerBase pointers themselves.
+-class TimerHeapIterator : public iterator<random_access_iterator_tag, TimerHeapElement, int> {
++// Uses a custom pointer and reference type that update indices for pointers in the heap.
++class TimerHeapIterator : public iterator<random_access_iterator_tag, TimerBase*, ptrdiff_t, TimerHeapPointer, TimerHeapReference> {
+ public:
+-    TimerHeapIterator() : m_index(-1) { }
+-    TimerHeapIterator(int i) : m_index(i) { checkConsistency(); }
+-
+-    TimerHeapIterator& operator++() { checkConsistency(); ++m_index; checkConsistency(); return *this; }
+-    TimerHeapIterator operator++(int) { checkConsistency(); checkConsistency(1); return m_index++; }
++    explicit TimerHeapIterator(TimerBase** pointer) : m_pointer(pointer) { checkConsistency(); }
+ 
+-    TimerHeapIterator& operator--() { checkConsistency(); --m_index; checkConsistency(); return *this; }
+-    TimerHeapIterator operator--(int) { checkConsistency(); checkConsistency(-1); return m_index--; }
++    TimerHeapIterator& operator++() { checkConsistency(); ++m_pointer; checkConsistency(); return *this; }
++    TimerHeapIterator operator++(int) { checkConsistency(1); return TimerHeapIterator(m_pointer++); }
+ 
+-    TimerHeapIterator& operator+=(int i) { checkConsistency(); m_index += i; checkConsistency(); return *this; }
+-    TimerHeapIterator& operator-=(int i) { checkConsistency(); m_index -= i; checkConsistency(); return *this; }
++    TimerHeapIterator& operator--() { checkConsistency(); --m_pointer; checkConsistency(); return *this; }
++    TimerHeapIterator operator--(int) { checkConsistency(-1); return TimerHeapIterator(m_pointer--); }
+ 
+-    TimerHeapElement operator*() const { return TimerHeapElement(m_index); }
+-    TimerHeapElement operator[](int i) const { return TimerHeapElement(m_index + i); }
++    TimerHeapIterator& operator+=(ptrdiff_t i) { checkConsistency(); m_pointer += i; checkConsistency(); return *this; }
++    TimerHeapIterator& operator-=(ptrdiff_t i) { checkConsistency(); m_pointer -= i; checkConsistency(); return *this; }
+ 
+-    int index() const { return m_index; }
++    TimerHeapReference operator*() const { return TimerHeapReference(*m_pointer); }
++    TimerHeapReference operator[](ptrdiff_t i) const { return TimerHeapReference(m_pointer[i]); }
++    TimerBase* operator->() const { return *m_pointer; }
+ 
+-    void checkConsistency(int offset = 0) const
++private:
++    void checkConsistency(ptrdiff_t offset = 0) const
+     {
+-        ASSERT_UNUSED(offset, m_index + offset >= 0);
+-        ASSERT_UNUSED(offset, m_index + offset <= static_cast<int>(timerHeap().size()));
++        ASSERT(m_pointer >= timerHeap().data());
++        ASSERT(m_pointer <= timerHeap().data() + timerHeap().size());
++        ASSERT_UNUSED(offset, m_pointer + offset >= timerHeap().data());
++        ASSERT_UNUSED(offset, m_pointer + offset <= timerHeap().data() + timerHeap().size());
+     }
+ 
+-private:
+-    int m_index;
++    friend bool operator==(TimerHeapIterator, TimerHeapIterator);
++    friend bool operator!=(TimerHeapIterator, TimerHeapIterator);
++    friend bool operator<(TimerHeapIterator, TimerHeapIterator);
++    friend bool operator>(TimerHeapIterator, TimerHeapIterator);
++    friend bool operator<=(TimerHeapIterator, TimerHeapIterator);
++    friend bool operator>=(TimerHeapIterator, TimerHeapIterator);
++    
++    friend TimerHeapIterator operator+(TimerHeapIterator, size_t);
++    friend TimerHeapIterator operator+(size_t, TimerHeapIterator);
++    
++    friend TimerHeapIterator operator-(TimerHeapIterator, size_t);
++    friend ptrdiff_t operator-(TimerHeapIterator, TimerHeapIterator);
++
++    TimerBase** m_pointer;
+ };
+ 
+-inline bool operator==(TimerHeapIterator a, TimerHeapIterator b) { return a.index() == b.index(); }
+-inline bool operator!=(TimerHeapIterator a, TimerHeapIterator b) { return a.index() != b.index(); }
+-inline bool operator<(TimerHeapIterator a, TimerHeapIterator b) { return a.index() < b.index(); }
++inline bool operator==(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer == b.m_pointer; }
++inline bool operator!=(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer != b.m_pointer; }
++inline bool operator<(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer < b.m_pointer; }
++inline bool operator>(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer > b.m_pointer; }
++inline bool operator<=(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer <= b.m_pointer; }
++inline bool operator>=(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer >= b.m_pointer; }
+ 
+-inline TimerHeapIterator operator+(TimerHeapIterator a, int b) { return a.index() + b; }
+-inline TimerHeapIterator operator+(int a, TimerHeapIterator b) { return a + b.index(); }
++inline TimerHeapIterator operator+(TimerHeapIterator a, size_t b) { return TimerHeapIterator(a.m_pointer + b); }
++inline TimerHeapIterator operator+(size_t a, TimerHeapIterator b) { return TimerHeapIterator(a + b.m_pointer); }
+ 
+-inline TimerHeapIterator operator-(TimerHeapIterator a, int b) { return a.index() - b; }
+-inline int operator-(TimerHeapIterator a, TimerHeapIterator b) { return a.index() - b.index(); }
++inline TimerHeapIterator operator-(TimerHeapIterator a, size_t b) { return TimerHeapIterator(a.m_pointer - b); }
++inline ptrdiff_t operator-(TimerHeapIterator a, TimerHeapIterator b) { return a.m_pointer - b.m_pointer; }
++
++// ----------------
++
++class TimerHeapLessThanFunction {
++public:
++    bool operator()(TimerBase*, TimerBase*) const;
++};
++
++inline bool TimerHeapLessThanFunction::operator()(TimerBase* a, TimerBase* b) const
++{
++    // The comparisons below are "backwards" because the heap puts the largest 
++    // element first and we want the lowest time to be the first one in the heap.
++    double aFireTime = a->m_nextFireTime;
++    double bFireTime = b->m_nextFireTime;
++    if (bFireTime != aFireTime)
++        return bFireTime < aFireTime;
++    
++    // We need to look at the difference of the insertion orders instead of comparing the two 
++    // outright in case of overflow. 
++    unsigned difference = a->m_heapInsertionOrder - b->m_heapInsertionOrder;
++    return difference < numeric_limits<unsigned>::max() / 2;
++}
+ 
+ // ----------------
+ 
+ TimerBase::TimerBase()
+     : m_nextFireTime(0)
++    , m_unalignedNextFireTime(0)
+     , m_repeatInterval(0)
+     , m_heapIndex(-1)
+ #ifndef NDEBUG
+@@ -181,7 +212,7 @@
+     ASSERT(m_thread == currentThread());
+ 
+     m_repeatInterval = repeatInterval;
+-    setNextFireTime(currentTime() + nextFireInterval);
++    setNextFireTime(monotonicallyIncreasingTime() + nextFireInterval);
+ }
+ 
+ void TimerBase::stop()
+@@ -199,7 +230,7 @@
+ double TimerBase::nextFireInterval() const
+ {
+     ASSERT(isActive());
+-    double current = currentTime();
++    double current = monotonicallyIncreasingTime();
+     if (m_nextFireTime < current)
+         return 0;
+     return m_nextFireTime - current;
+@@ -225,7 +256,8 @@
+ {
+     ASSERT(m_nextFireTime != 0);
+     checkHeapIndex();
+-    push_heap(TimerHeapIterator(0), TimerHeapIterator(m_heapIndex + 1));
++    TimerBase** heapData = timerHeap().data();
++    push_heap(TimerHeapIterator(heapData), TimerHeapIterator(heapData + m_heapIndex + 1), TimerHeapLessThanFunction());
+     checkHeapIndex();
+ }
+ 
+@@ -274,17 +306,23 @@
+ {
+     ASSERT(this == timerHeap().first());
+     checkHeapIndex();
+-    pop_heap(TimerHeapIterator(0), TimerHeapIterator(timerHeap().size()));
++    Vector<TimerBase*>& heap = timerHeap();
++    TimerBase** heapData = heap.data();
++    pop_heap(TimerHeapIterator(heapData), TimerHeapIterator(heapData + heap.size()), TimerHeapLessThanFunction());
+     checkHeapIndex();
+     ASSERT(this == timerHeap().last());
+ }
+ 
+-void TimerBase::setNextFireTime(double newTime)
++void TimerBase::setNextFireTime(double newUnalignedTime)
+ {
+     ASSERT(m_thread == currentThread());
+ 
++    if (m_unalignedNextFireTime != newUnalignedTime)
++        m_unalignedNextFireTime = newUnalignedTime;
++
+     // Keep heap valid while changing the next-fire time.
+     double oldTime = m_nextFireTime;
++    double newTime = alignedFireTime(newUnalignedTime);
+     if (oldTime != newTime) {
+         m_nextFireTime = newTime;
+         static unsigned currentHeapInsertionOrder;
+@@ -316,5 +354,16 @@
+     threadGlobalData().threadTimers().fireTimersInNestedEventLoop();
+ }
+ 
++void TimerBase::didChangeAlignmentInterval()
++{
++    setNextFireTime(m_unalignedNextFireTime);
++}
++
++double TimerBase::nextUnalignedFireInterval() const
++{
++    ASSERT(isActive());
++    return max(m_unalignedNextFireTime - monotonicallyIncreasingTime(), 0.0);
++}
++
+ } // namespace WebCore
+ 
+--- third_party/WebKit/Source/WebCore/platform/Timer.h~	2012-12-13 07:09:01.701944130 -0600
++++ third_party/WebKit/Source/WebCore/platform/Timer.h	2012-12-14 17:28:39.351932483 -0600
+@@ -50,16 +50,21 @@
+     bool isActive() const;
+ 
+     double nextFireInterval() const;
++    double nextUnalignedFireInterval() const;
+     double repeatInterval() const { return m_repeatInterval; }
+ 
+     void augmentFireInterval(double delta) { setNextFireTime(m_nextFireTime + delta); }
+     void augmentRepeatInterval(double delta) { augmentFireInterval(delta); m_repeatInterval += delta; }
+ 
++    void didChangeAlignmentInterval();
++
+     static void fireTimersInNestedEventLoop();
+ 
+ private:
+     virtual void fired() = 0;
+ 
++    virtual double alignedFireTime(double fireTime) const { return fireTime; }
++
+     void checkConsistency() const;
+     void checkHeapIndex() const;
+ 
+@@ -76,6 +81,7 @@
+     void heapPopMin();
+ 
+     double m_nextFireTime; // 0 if inactive
++    double m_unalignedNextFireTime; // m_nextFireTime not considering alignment interval
+     double m_repeatInterval; // 0 if not repeating
+     int m_heapIndex; // -1 if not in heap
+     unsigned m_heapInsertionOrder; // Used to keep order among equal-fire-time timers
+@@ -84,9 +90,9 @@
+     ThreadIdentifier m_thread;
+ #endif
+ 
+-    friend class TimerHeapElement;
+     friend class ThreadTimers;
+-    friend bool operator<(const TimerHeapElement&, const TimerHeapElement&);
++    friend class TimerHeapLessThanFunction;
++    friend class TimerHeapReference;
+ };
+ 
+ template <typename TimerFiredClass> class Timer : public TimerBase {
+@@ -109,6 +115,52 @@
+     return m_nextFireTime;
+ }
+ 
++template <typename TimerFiredClass> class DeferrableOneShotTimer : private TimerBase {
++public:
++    typedef void (TimerFiredClass::*TimerFiredFunction)(DeferrableOneShotTimer*);
++
++    DeferrableOneShotTimer(TimerFiredClass* o, TimerFiredFunction f, double delay)
++        : m_object(o)
++        , m_function(f)
++        , m_delay(delay)
++        , m_shouldRestartWhenTimerFires(false)
++    {
++    }
++
++    void restart()
++    {
++        // Setting this boolean is much more efficient than calling startOneShot
++        // again, which might result in rescheduling the system timer which
++        // can be quite expensive.
++
++        if (isActive()) {
++            m_shouldRestartWhenTimerFires = true;
++            return;
++        }
++        startOneShot(m_delay);
++    }
++
++    using TimerBase::stop;
++    using TimerBase::isActive;
++private:
++    virtual void fired()
++    {
++        if (m_shouldRestartWhenTimerFires) {
++            m_shouldRestartWhenTimerFires = false;
++            startOneShot(m_delay);
++            return;
++        }
++
++        (m_object->*m_function)(this);
++    }
++
++    TimerFiredClass* m_object;
++    TimerFiredFunction m_function;
++
++    double m_delay;
++    bool m_shouldRestartWhenTimerFires;
++};
++
+ }
+ 
+ #endif
+--- third_party/WebKit/Source/WebCore/platform/chromium/PlatformBridge.h~	2012-12-13 07:08:55.798944335 -0600
++++ third_party/WebKit/Source/WebCore/platform/chromium/PlatformBridge.h	2012-12-17 08:12:33.818947311 -0600
+@@ -230,7 +230,7 @@
+ 
+     // SharedTimers -------------------------------------------------------
+     static void setSharedTimerFiredFunction(void (*func)());
+-    static void setSharedTimerFireTime(double);
++    static void setSharedTimerFireInterval(double);
+     static void stopSharedTimer();
+ 
+     // StatsCounters ------------------------------------------------------
+@@ -244,6 +244,7 @@
+ 
+     // SystemTime ---------------------------------------------------------
+     static double currentTime();
++	static double monotonicallyIncreasingTime();
+ 
+     // Theming ------------------------------------------------------------
+ #if OS(WINDOWS)
+--- third_party/WebKit/Source/WebCore/platform/chromium/SharedTimerChromium.cpp~	2012-12-13 07:08:55.803944335 -0600
++++ third_party/WebKit/Source/WebCore/platform/chromium/SharedTimerChromium.cpp	2012-12-14 17:28:39.352932483 -0600
+@@ -35,9 +35,9 @@
+     PlatformBridge::setSharedTimerFiredFunction(f);
+ }
+ 
+-void setSharedTimerFireTime(double fireTime)
++void setSharedTimerFireInterval(double fireInterval)
+ {
+-    PlatformBridge::setSharedTimerFireTime(fireTime);
++    PlatformBridge::setSharedTimerFireInterval(fireInterval);
+ }
+ 
+ void stopSharedTimer()
+--- third_party/WebKit/Source/WebCore/platform/chromium/SystemTimeChromium.cpp~	2012-12-13 07:08:55.814944334 -0600
++++ third_party/WebKit/Source/WebCore/platform/chromium/SystemTimeChromium.cpp	2012-12-17 08:23:42.094924173 -0600
+@@ -42,6 +42,11 @@
+     return PlatformBridge::currentTime();
+ }
+ 
++double monotonicallyIncreasingTime()
++{
++    return PlatformBridge::monotonicallyIncreasingTime();
++}
++
+ float userIdleTime()
+ {
+     // Needed for back/forward cache, which we currently have disabled.
+--- third_party/WebKit/Source/WebCore/platform/gtk/SharedTimerGtk.cpp~	2012-12-13 07:08:57.986944259 -0600
++++ third_party/WebKit/Source/WebCore/platform/gtk/SharedTimerGtk.cpp	2012-12-14 17:28:39.352932483 -0600
+@@ -50,18 +50,11 @@
+     return FALSE;
+ }
+ 
+-void setSharedTimerFireTime(double fireTime)
++void setSharedTimerFireInterval(double interval)
+ {
+     ASSERT(sharedTimerFiredFunction);
+ 
+-    double interval = fireTime - currentTime();
+-    guint intervalInMS;
+-    if (interval < 0)
+-        intervalInMS = 0;
+-    else {
+-        interval *= 1000;
+-        intervalInMS = (guint)interval;
+-    }
++    guint intervalInMS = static_cast<guint>(interval * 1000);
+ 
+     stopSharedTimer();
+     sharedTimer = g_timeout_add_full(GDK_PRIORITY_REDRAW, intervalInMS, timeout_cb, 0, 0);
+@@ -69,12 +62,11 @@
+ 
+ void stopSharedTimer()
+ {
+-    gboolean s = FALSE;
+     if (sharedTimer == 0)
+         return;
+ 
+-    s = g_source_remove(sharedTimer);
+-    ASSERT(s);
++    gboolean removedSource = g_source_remove(sharedTimer);
++    ASSERT_UNUSED(removedSource, removedSource);
+     sharedTimer = 0;
+ }
+ 
+--- third_party/WebKit/Source/WebCore/platform/win/SharedTimerWin.cpp~	2012-12-13 07:08:43.381944765 -0600
++++ third_party/WebKit/Source/WebCore/platform/win/SharedTimerWin.cpp	2012-12-14 17:28:39.353932483 -0600
+@@ -146,21 +146,16 @@
+         PostMessage(timerWindowHandle, timerFiredMessage, 0, 0);
+ }
+ 
+-void setSharedTimerFireTime(double fireTime)
++void setSharedTimerFireInterval(double interval)
+ {
+     ASSERT(sharedTimerFiredFunction);
+ 
+-    double interval = fireTime - currentTime();
+     unsigned intervalInMS;
+-    if (interval < 0)
+-        intervalInMS = 0;
+-    else {
+         interval *= 1000;
+         if (interval > USER_TIMER_MAXIMUM)
+             intervalInMS = USER_TIMER_MAXIMUM;
+         else
+-            intervalInMS = (unsigned)interval;
+-    }
++        intervalInMS = static_cast<unsigned>(interval);
+ 
+     initializeOffScreenTimerWindow();
+     bool timerSet = false;
+--- third_party/WebKit/Source/WebCore/workers/WorkerRunLoop.cpp~	2012-12-13 07:09:04.059944049 -0600
++++ third_party/WebKit/Source/WebCore/workers/WorkerRunLoop.cpp	2012-12-14 17:28:39.353932483 -0600
+@@ -39,6 +39,7 @@
+ #include "WorkerRunLoop.h"
+ #include "WorkerContext.h"
+ #include "WorkerThread.h"
++#include <wtf/CurrentTime.h>
+ 
+ namespace WebCore {
+ 
+@@ -52,7 +53,7 @@
+ 
+     // SharedTimer interface.
+     virtual void setFiredFunction(void (*function)()) { m_sharedTimerFunction = function; }
+-    virtual void setFireTime(double fireTime) { m_nextFireTime = fireTime; }
++    virtual void setFireInterval(double interval) { m_nextFireTime = interval + currentTime(); }
+     virtual void stop() { m_nextFireTime = 0; }
+ 
+     bool isActive() { return m_sharedTimerFunction && m_nextFireTime; }
+--- third_party/WebKit/Source/WebKit/chromium/public/WebKitClient.h~	2012-12-13 07:07:16.225947780 -0600
++++ third_party/WebKit/Source/WebKit/chromium/public/WebKitClient.h	2012-12-14 17:28:39.354932483 -0600
+@@ -263,6 +263,7 @@
+ 
+     // Wall clock time in seconds since the epoch.
+     virtual double currentTime() { return 0; }
++	virtual double monotonicallyIncreasingTime() { return 0; }
+ 
+     virtual void cryptographicallyRandomValues(unsigned char* buffer, size_t length)
+     {
+@@ -272,7 +273,7 @@
+ 
+     // Delayed work is driven by a shared timer.
+     virtual void setSharedTimerFiredFunction(void (*func)()) { }
+-    virtual void setSharedTimerFireTime(double fireTime) { }
++    virtual void setSharedTimerFireInterval(double fireInterval) { }
+     virtual void stopSharedTimer() { }
+ 
+     // Callable from a background WebKit thread.
+--- third_party/WebKit/Source/WebKit/chromium/src/ChromiumCurrentTime.cpp~	2012-12-13 07:07:12.691947905 -0600
++++ third_party/WebKit/Source/WebKit/chromium/src/ChromiumCurrentTime.cpp	2012-12-14 17:28:39.354932483 -0600
+@@ -41,4 +41,10 @@
+     return WebKit::webKitClient()->currentTime();
+ }
+ 
++double monotonicallyIncreasingTime()
++{
++    return WebKit::webKitClient()->monotonicallyIncreasingTime();
++}
++
+ }  // namespace WTF
++
+--- third_party/WebKit/Source/WebKit/chromium/src/PlatformBridge.cpp~	2012-12-13 07:07:12.328947916 -0600
++++ third_party/WebKit/Source/WebKit/chromium/src/PlatformBridge.cpp	2012-12-17 08:13:06.891946166 -0600
+@@ -646,9 +646,9 @@
+     webKitClient()->setSharedTimerFiredFunction(func);
+ }
+ 
+-void PlatformBridge::setSharedTimerFireTime(double fireTime)
++void PlatformBridge::setSharedTimerFireInterval(double fireInterval)
+ {
+-    webKitClient()->setSharedTimerFireTime(fireTime);
++    webKitClient()->setSharedTimerFireInterval(fireInterval);
+ }
+ 
+ void PlatformBridge::stopSharedTimer()
+@@ -692,6 +692,11 @@
+     return webKitClient()->currentTime();
+ }
+ 
++double PlatformBridge::monotonicallyIncreasingTime() 
++{
++    return webKitClient()->monotonicallyIncreasingTime();
++}
++
+ // Theming --------------------------------------------------------------------
+ 
+ #if OS(WINDOWS)
+--- base/time.cc~	2012-12-13 07:03:41.241955226 -0600
++++ base/time.cc	2012-12-14 09:47:19.115890861 -0600
+@@ -1,8 +1,16 @@
+-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+ #include "base/time.h"
++
++#include <math.h>
++#if defined(OS_WIN)
++#include <float.h>
++#endif
++
++#include <limits>
++
+ #include "base/sys_string_conversions.h"
+ #include "base/third_party/nspr/prtime.h"
+ 
+@@ -10,6 +18,12 @@
+ 
+ namespace base {
+ 
++namespace {
++#if defined(OS_WIN)
++inline bool isnan(double num) { return !!_isnan(num); }
++#endif
++}
++
+ // TimeDelta ------------------------------------------------------------------
+ 
+ int TimeDelta::InDays() const {
+@@ -52,35 +66,80 @@
+ // Time -----------------------------------------------------------------------
+ 
+ // static
++Time Time::Max() {
++  return Time(std::numeric_limits<int64>::max());
++}
++
++// static
+ Time Time::FromTimeT(time_t tt) {
+   if (tt == 0)
+     return Time();  // Preserve 0 so we can tell it doesn't exist.
++  if (tt == std::numeric_limits<time_t>::max())
++    return Max();
+   return Time((tt * kMicrosecondsPerSecond) + kTimeTToMicrosecondsOffset);
+ }
+ 
+ time_t Time::ToTimeT() const {
+-  if (us_ == 0)
++  if (is_null())
+     return 0;  // Preserve 0 so we can tell it doesn't exist.
++  if (is_max()) {
++    // Preserve max without offset to prevent overflow.
++    return std::numeric_limits<time_t>::max();
++  }
++  if (std::numeric_limits<int64>::max() - kTimeTToMicrosecondsOffset <= us_) {
++    DLOG(WARNING) << "Overflow when converting base::Time with internal " <<
++                     "value " << us_ << " to time_t.";
++    return std::numeric_limits<time_t>::max();
++  }
+   return (us_ - kTimeTToMicrosecondsOffset) / kMicrosecondsPerSecond;
+ }
+ 
+ // static
+ Time Time::FromDoubleT(double dt) {
+-  if (dt == 0)
++  if (dt == 0 || isnan(dt))
+     return Time();  // Preserve 0 so we can tell it doesn't exist.
++  if (dt == std::numeric_limits<double>::max())
++    return Max();
+   return Time(static_cast<int64>((dt *
+                                   static_cast<double>(kMicrosecondsPerSecond)) +
+                                  kTimeTToMicrosecondsOffset));
+ }
+ 
+ double Time::ToDoubleT() const {
+-  if (us_ == 0)
++  if (is_null())
+     return 0;  // Preserve 0 so we can tell it doesn't exist.
++  if (is_max()) {
++    // Preserve max without offset to prevent overflow.
++    return std::numeric_limits<double>::max();
++  }
+   return (static_cast<double>(us_ - kTimeTToMicrosecondsOffset) /
+           static_cast<double>(kMicrosecondsPerSecond));
+ }
+ 
+ // static
++Time Time::FromJsTime(double ms_since_epoch) {
++  // The epoch is a valid time, so this constructor doesn't interpret
++  // 0 as the null time.
++  if (ms_since_epoch == std::numeric_limits<double>::max())
++    return Max();
++  return Time(static_cast<int64>(ms_since_epoch * kMicrosecondsPerMillisecond) +
++              kTimeTToMicrosecondsOffset);
++}
++
++double Time::ToJsTime() const {
++  if (is_null()) {
++    // Preserve 0 so the invalid result doesn't depend on the platform.
++    return 0;
++  }
++  if (is_max()) {
++    // Preserve max without offset to prevent overflow.
++    return std::numeric_limits<double>::max();
++  }
++  return (static_cast<double>(us_ - kTimeTToMicrosecondsOffset) /
++          kMicrosecondsPerMillisecond);
++}
++
++// static
+ Time Time::UnixEpoch() {
+   Time time;
+   time.us_ = kTimeTToMicrosecondsOffset;
+--- base/time.h~	2012-12-13 07:03:40.104955265 -0600
++++ base/time.h	2012-12-14 09:47:19.116890863 -0600
+@@ -1,32 +1,40 @@
+-// Copyright (c) 2011 The Chromium Authors. All rights reserved.
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+ // Time represents an absolute point in time, internally represented as
+-// microseconds (s/1,000,000) since a platform-dependent epoch.  Each
+-// platform's epoch, along with other system-dependent clock interface
+-// routines, is defined in time_PLATFORM.cc.
++// microseconds (s/1,000,000) since the Windows epoch (1601-01-01 00:00:00 UTC)
++// (See http://crbug.com/14734).  System-dependent clock interface routines are
++// defined in time_PLATFORM.cc.
+ //
+ // TimeDelta represents a duration of time, internally represented in
+ // microseconds.
+ //
+-// TimeTicks represents an abstract time that is always incrementing for use
+-// in measuring time durations. It is internally represented in microseconds.
+-// It can not be converted to a human-readable time, but is guaranteed not to
+-// decrease (if the user changes the computer clock, Time::Now() may actually
+-// decrease or jump).
++// TimeTicks represents an abstract time that is most of the time incrementing
++// for use in measuring time durations. It is internally represented in
++// microseconds.  It can not be converted to a human-readable time, but is
++// guaranteed not to decrease (if the user changes the computer clock,
++// Time::Now() may actually decrease or jump).  But note that TimeTicks may
++// "stand still", for example if the computer suspended.
+ //
+ // These classes are represented as only a 64-bit value, so they can be
+ // efficiently passed by value.
+ 
+ #ifndef BASE_TIME_H_
+ #define BASE_TIME_H_
+-#pragma once
+ 
+ #include <time.h>
+ 
++#include "base/atomicops.h"
++//#include "base/base_export.h"
+ #include "base/basictypes.h"
+ 
++#if defined(OS_MACOSX)
++#include <CoreFoundation/CoreFoundation.h>
++// Avoid Mac system header macro leak.
++#undef TYPE_BOOL
++#endif
++
+ #if defined(OS_POSIX)
+ // For struct timeval.
+ #include <sys/time.h>
+@@ -38,14 +46,13 @@
+ #include <windows.h>
+ #endif
+ 
++#include <limits>
++
+ namespace base {
+ 
+ class Time;
+ class TimeTicks;
+ 
+-// This unit test does a lot of manual time manipulation.
+-class PageLoadTrackerUnitTest;
+-
+ // TimeDelta ------------------------------------------------------------------
+ 
+ class TimeDelta {
+@@ -60,10 +67,22 @@
+   static TimeDelta FromSeconds(int64 secs);
+   static TimeDelta FromMilliseconds(int64 ms);
+   static TimeDelta FromMicroseconds(int64 us);
++#if defined(OS_WIN)
++  static TimeDelta FromQPCValue(LONGLONG qpc_value);
++#endif
++
++  // Converts an integer value representing TimeDelta to a class. This is used
++  // when deserializing a |TimeDelta| structure, using a value known to be
++  // compatible. It is not provided as a constructor because the integer type
++  // may be unclear from the perspective of a caller.
++  static TimeDelta FromInternalValue(int64 delta) {
++    return TimeDelta(delta);
++  }
+ 
+   // Returns the internal numeric value of the TimeDelta object. Please don't
+   // use this and do arithmetic on it, as it is more error prone than using the
+   // provided operators.
++  // For serializing, use FromInternalValue to reconstitute.
+   int64 ToInternalValue() const {
+     return delta_;
+   }
+@@ -230,6 +249,11 @@
+     return us_ == 0;
+   }
+ 
++  // Returns true if the time object is the maximum time.
++  bool is_max() const {
++    return us_ == std::numeric_limits<int64>::max();
++  }
++
+   // Returns the time for epoch in Unix-like system (Jan 1, 1970).
+   static Time UnixEpoch();
+ 
+@@ -238,6 +262,10 @@
+   // times are increasing, or that two calls to Now() won't be the same.
+   static Time Now();
+ 
++  // Returns the maximum time, which should be greater than any reasonable time
++  // with which we might compare it.
++  static Time Max();
++
+   // Returns the current time. Same as Now() except that this function always
+   // uses system time so that there are no discrepancies between the returned
+   // time and system time even on virtual environments including our test bot.
+@@ -258,10 +286,22 @@
+   static Time FromDoubleT(double dt);
+   double ToDoubleT() const;
+ 
++  // Converts to/from the Javascript convention for times, a number of
++  // milliseconds since the epoch:
++  // https://developer.mozilla.org/en/JavaScript/Reference/Global_Objects/Date/getTime.
++  static Time FromJsTime(double ms_since_epoch);
++  double ToJsTime() const;
++
+ #if defined(OS_POSIX)
++  static Time FromTimeVal(struct timeval t);
+   struct timeval ToTimeVal() const;
+ #endif
+ 
++#if defined(OS_MACOSX)
++  static Time FromCFAbsoluteTime(CFAbsoluteTime t);
++  CFAbsoluteTime ToCFAbsoluteTime() const;
++#endif
++
+ #if defined(OS_WIN)
+   static Time FromFileTime(FILETIME ft);
+   FILETIME ToFileTime() const;
+@@ -283,10 +323,16 @@
+   // Activates or deactivates the high resolution timer based on the |activate|
+   // flag.  If the HighResolutionTimer is not Enabled (see
+   // EnableHighResolutionTimer), this function will return false.  Otherwise
+-  // returns true.
++  // returns true.  Each successful activate call must be paired with a
++  // subsequent deactivate call.
+   // All callers to activate the high resolution timer must eventually call
+   // this function to deactivate the high resolution timer.
+   static bool ActivateHighResolutionTimer(bool activate);
++
++  // Returns true if the high resolution timer is both enabled and activated.
++  // This is provided for testing only, and is not tracked in a thread-safe
++  // way.
++  static bool IsHighResolutionTimerInUse();
+ #endif
+ 
+   // Converts an exploded structure representing either the local time or UTC
+@@ -405,6 +451,9 @@
+   // when using battery power, we might elect to prevent high speed timers
+   // which would draw more power.
+   static bool high_resolution_timer_enabled_;
++  // Count of activations on the high resolution timer.  Only use in tests
++  // which are single threaded.
++  static int high_resolution_timer_activated_;
+ #endif
+ 
+   // Time in microseconds in UTC.
+@@ -465,10 +514,19 @@
+   // SHOULD ONLY BE USED WHEN IT IS REALLY NEEDED.
+   static TimeTicks HighResNow();
+ 
++  // Returns the current system trace time or, if none is defined, the current
++  // high-res time (i.e. HighResNow()). On systems where a global trace clock
++  // is defined, timestamping TraceEvents's with this value guarantees
++  // synchronization between events collected inside chrome and events
++  // collected outside (e.g. kernel, X server).
++  static TimeTicks NowFromSystemTraceTime();
++
+ #if defined(OS_WIN)
+   // Get the absolute value of QPC time drift. For testing.
+   static int64 GetQPCDriftMicroseconds();
+ 
++  static TimeTicks FromQPCValue(LONGLONG qpc_value);
++
+   // Returns true if the high resolution clock is working on this system.
+   // This is only for testing.
+   static bool IsHighResClockWorking();
+@@ -479,7 +537,16 @@
+     return ticks_ == 0;
+   }
+ 
++  // Converts an integer value representing TimeTicks to a class. This is used
++  // when deserializing a |TimeTicks| structure, using a value known to be
++  // compatible. It is not provided as a constructor because the integer type
++  // may be unclear from the perspective of a caller.
++  static TimeTicks FromInternalValue(int64 ticks) {
++    return TimeTicks(ticks);
++  }
++
+   // Returns the internal numeric value of the TimeTicks object.
++  // For serializing, use FromInternalValue to reconstitute.
+   int64 ToInternalValue() const {
+     return ticks_;
+   }
+@@ -534,7 +601,6 @@
+ 
+  protected:
+   friend class TimeDelta;
+-  friend class PageLoadTrackerUnitTest;
+ 
+   // Please use Now() to create a new object. This is for internal use
+   // and testing. Ticks is in microseconds.
+--- base/time_posix.cc~	2012-12-13 07:03:40.030955268 -0600
++++ base/time_posix.cc	2012-12-14 09:47:19.117890864 -0600
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2010 The Chromium Authors. All rights reserved.
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+@@ -6,8 +6,60 @@
+ #include "base/basictypes.h"
+ #include "base/logging.h"
+ 
++#if defined(OS_ANDROID)
++#include "base/os_compat_android.h"
++#elif defined(OS_NACL)
++#include "base/os_compat_nacl.h"
++#endif
++
++namespace {
++
++// Define a system-specific SysTime that wraps either to a time_t or
++// a time64_t depending on the host system, and associated convertion.
++// See crbug.com/162007
++#if defined(OS_ANDROID)
++typedef time64_t SysTime;
++
++SysTime SysTimeFromTimeStruct(struct tm* timestruct, bool is_local) {
++  if (is_local)
++    return mktime64(timestruct);
++  else
++    return timegm64(timestruct);
++}
++
++void SysTimeToTimeStruct(SysTime t, struct tm* timestruct, bool is_local) {
++  if (is_local)
++    localtime64_r(&t, timestruct);
++  else
++    gmtime64_r(&t, timestruct);
++}
++
++#else  // OS_ANDROID
++typedef time_t SysTime;
++
++SysTime SysTimeFromTimeStruct(struct tm* timestruct, bool is_local) {
++  if (is_local)
++    return mktime(timestruct);
++  else
++    return timegm(timestruct);
++}
++
++void SysTimeToTimeStruct(SysTime t, struct tm* timestruct, bool is_local) {
++  if (is_local)
++    localtime_r(&t, timestruct);
++  else
++    gmtime_r(&t, timestruct);
++}
++#endif  // OS_ANDROID
++
++}  // namespace
++
+ namespace base {
+ 
++#if defined(OS_ANDROID)
++#define _POSIX_MONOTONIC_CLOCK 1
++#endif
++
+ struct timespec TimeDelta::ToTimeSpec() const {
+   int64 microseconds = InMicroseconds();
+   time_t seconds = 0;
+@@ -23,7 +79,7 @@
+   }
+   struct timespec result =
+       {seconds,
+-       microseconds * Time::kNanosecondsPerMicrosecond};
++       static_cast<long>(microseconds * Time::kNanosecondsPerMicrosecond)};
+   return result;
+ }
+ 
+@@ -59,6 +115,10 @@
+   struct timezone tz = { 0, 0 };  // UTC
+   if (gettimeofday(&tv, &tz) != 0) {
+     DCHECK(0) << "Could not determine time of day";
++    LOG_ERRNO(ERROR) << "Call to gettimeofday failed.";
++    // Return null instead of uninitialized |tv| value, which contains random
++    // garbage data. This may result in the crash seen in crbug.com/147570.
++    return Time();
+   }
+   // Combine seconds and microseconds in a 64-bit field containing microseconds
+   // since the epoch.  That's enough for nearly 600 centuries.  Adjust from
+@@ -77,15 +137,30 @@
+   // Time stores times with microsecond resolution, but Exploded only carries
+   // millisecond resolution, so begin by being lossy.  Adjust from Windows
+   // epoch (1601) to Unix epoch (1970);
+-  int64 milliseconds = (us_ - kWindowsEpochDeltaMicroseconds) /
++  int64 microseconds = us_ - kWindowsEpochDeltaMicroseconds;
++  // The following values are all rounded towards -infinity.
++  int64 milliseconds;  // Milliseconds since epoch.
++  SysTime seconds;  // Seconds since epoch.
++  int millisecond;  // Exploded millisecond value (0-999).
++  if (microseconds >= 0) {
++    // Rounding towards -infinity <=> rounding towards 0, in this case.
++    milliseconds = microseconds / kMicrosecondsPerMillisecond;
++    seconds = milliseconds / kMillisecondsPerSecond;
++    millisecond = milliseconds % kMillisecondsPerSecond;
++  } else {
++    // Round these *down* (towards -infinity).
++    milliseconds = (microseconds - kMicrosecondsPerMillisecond + 1) /
+       kMicrosecondsPerMillisecond;
+-  time_t seconds = milliseconds / kMillisecondsPerSecond;
++    seconds = (milliseconds - kMillisecondsPerSecond + 1) /
++              kMillisecondsPerSecond;
++    // Make this nonnegative (and between 0 and 999 inclusive).
++    millisecond = milliseconds % kMillisecondsPerSecond;
++    if (millisecond < 0)
++      millisecond += kMillisecondsPerSecond;
++  }
+ 
+   struct tm timestruct;
+-  if (is_local)
+-    localtime_r(&seconds, &timestruct);
+-  else
+-    gmtime_r(&seconds, &timestruct);
++  SysTimeToTimeStruct(seconds, &timestruct, is_local);
+ 
+   exploded->year         = timestruct.tm_year + 1900;
+   exploded->month        = timestruct.tm_mon + 1;
+@@ -94,7 +169,7 @@
+   exploded->hour         = timestruct.tm_hour;
+   exploded->minute       = timestruct.tm_min;
+   exploded->second       = timestruct.tm_sec;
+-  exploded->millisecond  = milliseconds % kMillisecondsPerSecond;
++  exploded->millisecond  = millisecond;
+ }
+ 
+ // static
+@@ -109,14 +184,12 @@
+   timestruct.tm_wday   = exploded.day_of_week;  // mktime/timegm ignore this
+   timestruct.tm_yday   = 0;     // mktime/timegm ignore this
+   timestruct.tm_isdst  = -1;    // attempt to figure it out
++#if !defined(OS_NACL) && !defined(OS_SOLARIS)
+   timestruct.tm_gmtoff = 0;     // not a POSIX field, so mktime/timegm ignore
+   timestruct.tm_zone   = NULL;  // not a POSIX field, so mktime/timegm ignore
++#endif
+ 
+-  time_t seconds;
+-  if (is_local)
+-    seconds = mktime(&timestruct);
+-  else
+-    seconds = timegm(&timestruct);
++  SysTime seconds = SysTimeFromTimeStruct(&timestruct, is_local);
+ 
+   int64 milliseconds;
+   // Handle overflow.  Clamping the range to what mktime and timegm might
+@@ -140,10 +213,10 @@
+     // 999ms to avoid the time being less than any other possible value that
+     // this function can return.
+     if (exploded.year < 1969) {
+-      milliseconds = std::numeric_limits<time_t>::min() *
++      milliseconds = std::numeric_limits<SysTime>::min() *
+                      kMillisecondsPerSecond;
+     } else {
+-      milliseconds = (std::numeric_limits<time_t>::max() *
++      milliseconds = (std::numeric_limits<SysTime>::max() *
+                       kMillisecondsPerSecond) +
+                      kMillisecondsPerSecond - 1;
+     }
+@@ -160,7 +233,7 @@
+ // FreeBSD 6 has CLOCK_MONOLITHIC but defines _POSIX_MONOTONIC_CLOCK to -1.
+ #if (defined(OS_POSIX) &&                                               \
+      defined(_POSIX_MONOTONIC_CLOCK) && _POSIX_MONOTONIC_CLOCK >= 0) || \
+-     defined(OS_FREEBSD) || defined(OS_OPENBSD)
++     defined(OS_BSD) || defined(OS_ANDROID)
+ 
+ // static
+ TimeTicks TimeTicks::Now() {
+@@ -178,7 +251,6 @@
+ 
+   return TimeTicks(absolute_micro);
+ }
+-
+ #else  // _POSIX_MONOTONIC_CLOCK
+ #error No usable tick clock function on this platform.
+ #endif  // _POSIX_MONOTONIC_CLOCK
+@@ -188,10 +260,67 @@
+   return Now();
+ }
+ 
++#if defined(OS_CHROMEOS)
++// Force definition of the system trace clock; it is a chromeos-only api
++// at the moment and surfacing it in the right place requires mucking
++// with glibc et al.
++#define CLOCK_SYSTEM_TRACE 11
++
++// static
++TimeTicks TimeTicks::NowFromSystemTraceTime() {
++  uint64_t absolute_micro;
++
++  struct timespec ts;
++  if (clock_gettime(CLOCK_SYSTEM_TRACE, &ts) != 0) {
++    // NB: fall-back for a chrome os build running on linux
++    return HighResNow();
++  }
++
++  absolute_micro =
++      (static_cast<int64>(ts.tv_sec) * Time::kMicrosecondsPerSecond) +
++      (static_cast<int64>(ts.tv_nsec) / Time::kNanosecondsPerMicrosecond);
++
++  return TimeTicks(absolute_micro);
++}
++
++#else // !defined(OS_CHROMEOS)
++
++// static
++TimeTicks TimeTicks::NowFromSystemTraceTime() {
++  return HighResNow();
++}
++
++#endif // defined(OS_CHROMEOS)
++
+ #endif  // !OS_MACOSX
+ 
++// static
++Time Time::FromTimeVal(struct timeval t) {
++  DCHECK_LT(t.tv_usec, static_cast<int>(Time::kMicrosecondsPerSecond));
++  DCHECK_GE(t.tv_usec, 0);
++  if (t.tv_usec == 0 && t.tv_sec == 0)
++    return Time();
++  if (t.tv_usec == static_cast<suseconds_t>(Time::kMicrosecondsPerSecond) - 1 &&
++      t.tv_sec == std::numeric_limits<time_t>::max())
++    return Max();
++  return Time(
++      (static_cast<int64>(t.tv_sec) * Time::kMicrosecondsPerSecond) +
++      t.tv_usec +
++      kTimeTToMicrosecondsOffset);
++}
++
+ struct timeval Time::ToTimeVal() const {
+   struct timeval result;
++  if (is_null()) {
++    result.tv_sec = 0;
++    result.tv_usec = 0;
++    return result;
++  }
++  if (is_max()) {
++    result.tv_sec = std::numeric_limits<time_t>::max();
++    result.tv_usec = static_cast<suseconds_t>(Time::kMicrosecondsPerSecond) - 1;
++    return result;
++  }
+   int64 us = us_ - kTimeTToMicrosecondsOffset;
+   result.tv_sec = us / Time::kMicrosecondsPerSecond;
+   result.tv_usec = us % Time::kMicrosecondsPerSecond;
+--- base/time_win.cc~	2012-12-13 07:03:39.087955299 -0600
++++ base/time_win.cc	2012-12-14 09:47:19.118890864 -0600
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+@@ -62,7 +62,7 @@
+ }
+ 
+ void MicrosecondsToFileTime(int64 us, FILETIME* ft) {
+-  DCHECK(us >= 0) << "Time is less than 0, negative values are not "
++  DCHECK_GE(us, 0LL) << "Time is less than 0, negative values are not "
+       "representable in FILETIME";
+ 
+   // Multiply by 10 to convert milliseconds to 100-nanoseconds. Bit_cast will
+@@ -99,6 +99,7 @@
+ const int64 Time::kTimeTToMicrosecondsOffset = GG_INT64_C(11644473600000000);
+ 
+ bool Time::high_resolution_timer_enabled_ = false;
++int Time::high_resolution_timer_activated_ = 0;
+ 
+ // static
+ Time Time::Now() {
+@@ -140,10 +141,23 @@
+ 
+ // static
+ Time Time::FromFileTime(FILETIME ft) {
++  if (bit_cast<int64, FILETIME>(ft) == 0)
++    return Time();
++  if (ft.dwHighDateTime == std::numeric_limits<DWORD>::max() &&
++      ft.dwLowDateTime == std::numeric_limits<DWORD>::max())
++    return Max();
+   return Time(FileTimeToMicroseconds(ft));
+ }
+ 
+ FILETIME Time::ToFileTime() const {
++  if (is_null())
++    return bit_cast<FILETIME, int64>(0);
++  if (is_max()) {
++    FILETIME result;
++    result.dwHighDateTime = std::numeric_limits<DWORD>::max();
++    result.dwLowDateTime = std::numeric_limits<DWORD>::max();
++    return result;
++  }
+   FILETIME utc_ft;
+   MicrosecondsToFileTime(us_, &utc_ft);
+   return utc_ft;
+@@ -162,22 +176,36 @@
+ }
+ 
+ // static
+-bool Time::ActivateHighResolutionTimer(bool activate) {
+-  if (!high_resolution_timer_enabled_)
++bool Time::ActivateHighResolutionTimer(bool activating) {
++  if (!high_resolution_timer_enabled_ && activating)
+     return false;
+ 
+   // Using anything other than 1ms makes timers granular
+   // to that interval.
+   const int kMinTimerIntervalMs = 1;
+   MMRESULT result;
+-  if (activate)
++  if (activating) {
+     result = timeBeginPeriod(kMinTimerIntervalMs);
+-  else
++    high_resolution_timer_activated_++;
++  } else {
+     result = timeEndPeriod(kMinTimerIntervalMs);
++    high_resolution_timer_activated_--;
++  }
+   return result == TIMERR_NOERROR;
+ }
+ 
+ // static
++bool Time::IsHighResolutionTimerInUse() {
++  // Note:  we should track the high_resolution_timer_activated_ value
++  // under a lock if we want it to be accurate in a system with multiple
++  // message loops.  We don't do that - because we don't want to take the
++  // expense of a lock for this.  We *only* track this value so that unit
++  // tests can see if the high resolution timer is on or off.
++  return high_resolution_timer_enabled_ &&
++      high_resolution_timer_activated_ > 0;
++}
++
++// static
+ Time Time::FromExploded(bool is_local, const Exploded& exploded) {
+   // Create the system struct representing our exploded time. It will either be
+   // in local time or UTC.
+@@ -191,40 +219,54 @@
+   st.wSecond = exploded.second;
+   st.wMilliseconds = exploded.millisecond;
+ 
+-  // Convert to FILETIME.
+   FILETIME ft;
+-  if (!SystemTimeToFileTime(&st, &ft)) {
+-    NOTREACHED() << "Unable to convert time";
+-    return Time(0);
+-  }
+-
++  bool success = true;
+   // Ensure that it's in UTC.
+   if (is_local) {
+-    FILETIME utc_ft;
+-    LocalFileTimeToFileTime(&ft, &utc_ft);
+-    return Time(FileTimeToMicroseconds(utc_ft));
++    SYSTEMTIME utc_st;
++    success = TzSpecificLocalTimeToSystemTime(NULL, &st, &utc_st) &&
++              SystemTimeToFileTime(&utc_st, &ft);
++  } else {
++    success = !!SystemTimeToFileTime(&st, &ft);
++  }
++
++  if (!success) {
++    NOTREACHED() << "Unable to convert time";
++    return Time(0);
+   }
+   return Time(FileTimeToMicroseconds(ft));
+ }
+ 
+ void Time::Explode(bool is_local, Exploded* exploded) const {
++  if (us_ < 0LL) {
++    // We are not able to convert it to FILETIME.
++    ZeroMemory(exploded, sizeof(*exploded));
++    return;
++  }
++
+   // FILETIME in UTC.
+   FILETIME utc_ft;
+   MicrosecondsToFileTime(us_, &utc_ft);
+ 
+   // FILETIME in local time if necessary.
+-  BOOL success = TRUE;
+-  FILETIME ft;
+-  if (is_local)
+-    success = FileTimeToLocalFileTime(&utc_ft, &ft);
+-  else
+-    ft = utc_ft;
+-
++  bool success = true;
+   // FILETIME in SYSTEMTIME (exploded).
+   SYSTEMTIME st;
+-  if (!success || !FileTimeToSystemTime(&ft, &st)) {
++  if (is_local) {
++    SYSTEMTIME utc_st;
++    // We don't use FileTimeToLocalFileTime here, since it uses the current
++    // settings for the time zone and daylight saving time. Therefore, if it is
++    // daylight saving time, it will take daylight saving time into account,
++    // even if the time you are converting is in standard time.
++    success = FileTimeToSystemTime(&utc_ft, &utc_st) &&
++              SystemTimeToTzSpecificLocalTime(NULL, &utc_st, &st);
++  } else {
++    success = !!FileTimeToSystemTime(&utc_ft, &st);
++  }
++
++  if (!success) {
+     NOTREACHED() << "Unable to convert time, don't know why";
+-    ZeroMemory(exploded, sizeof(exploded));
++    ZeroMemory(exploded, sizeof(*exploded));
+     return;
+   }
+ 
+@@ -315,11 +357,11 @@
+   }
+ 
+   bool IsUsingHighResClock() {
+-    return ticks_per_microsecond_ != 0.0;
++    return ticks_per_second_ != 0.0;
+   }
+ 
+   void DisableHighResClock() {
+-    ticks_per_microsecond_ = 0.0;
++    ticks_per_second_ = 0.0;
+   }
+ 
+   TimeDelta Now() {
+@@ -334,12 +376,31 @@
+     if (!IsUsingHighResClock())
+       return 0;
+ 
+-    return abs((UnreliableNow() - ReliableNow()) - skew_);
++    // The static_cast<long> is needed as a hint to VS 2008 to tell it
++    // which version of abs() to use. Other compilers don't seem to
++    // need it, including VS 2010, but to keep code identical we use it
++    // everywhere.
++    // TODO(joi): Remove the hint if/when we no longer support VS 2008.
++    return abs(static_cast<long>((UnreliableNow() - ReliableNow()) - skew_));
++  }
++
++  int64 QPCValueToMicroseconds(LONGLONG qpc_value) {
++    if (!ticks_per_second_)
++      return 0;
++
++    // Intentionally calculate microseconds in a round about manner to avoid
++    // overflow and precision issues. Think twice before simplifying!
++    int64 whole_seconds = qpc_value / ticks_per_second_;
++    int64 leftover_ticks = qpc_value % ticks_per_second_;
++    int64 microseconds = (whole_seconds * Time::kMicrosecondsPerSecond) +
++                         ((leftover_ticks * Time::kMicrosecondsPerSecond) /
++                          ticks_per_second_);
++    return microseconds;
+   }
+ 
+  private:
+   HighResNowSingleton()
+-    : ticks_per_microsecond_(0.0),
++    : ticks_per_second_(0),
+       skew_(0) {
+     InitializeClock();
+ 
+@@ -355,8 +416,7 @@
+     LARGE_INTEGER ticks_per_sec = {0};
+     if (!QueryPerformanceFrequency(&ticks_per_sec))
+       return;  // Broken, we don't guarantee this function works.
+-    ticks_per_microsecond_ = static_cast<float>(ticks_per_sec.QuadPart) /
+-      static_cast<float>(Time::kMicrosecondsPerSecond);
++    ticks_per_second_ = ticks_per_sec.QuadPart;
+ 
+     skew_ = UnreliableNow() - ReliableNow();
+   }
+@@ -365,7 +425,7 @@
+   int64 UnreliableNow() {
+     LARGE_INTEGER now;
+     QueryPerformanceCounter(&now);
+-    return static_cast<int64>(now.QuadPart / ticks_per_microsecond_);
++    return QPCValueToMicroseconds(now.QuadPart);
+   }
+ 
+   // Get the number of microseconds since boot in a reliable fashion.
+@@ -373,9 +433,7 @@
+     return RolloverProtectedNow().InMicroseconds();
+   }
+ 
+-  // Cached clock frequency -> microseconds. This assumes that the clock
+-  // frequency is faster than one microsecond (which is 1MHz, should be OK).
+-  float ticks_per_microsecond_;  // 0 indicates QPF failed and we're broken.
++  int64 ticks_per_second_;  // 0 indicates QPF failed and we're broken.
+   int64 skew_;  // Skew between lo-res and hi-res clocks (for debugging).
+ 
+   friend struct DefaultSingletonTraits<HighResNowSingleton>;
+@@ -402,11 +460,30 @@
+ }
+ 
+ // static
++TimeTicks TimeTicks::NowFromSystemTraceTime() {
++  return HighResNow();
++}
++
++// static
+ int64 TimeTicks::GetQPCDriftMicroseconds() {
+   return HighResNowSingleton::GetInstance()->GetQPCDriftMicroseconds();
+ }
+ 
+ // static
++TimeTicks TimeTicks::FromQPCValue(LONGLONG qpc_value) {
++  return TimeTicks(
++      HighResNowSingleton::GetInstance()->QPCValueToMicroseconds(qpc_value));
++}
++
++// static
+ bool TimeTicks::IsHighResClockWorking() {
+   return HighResNowSingleton::GetInstance()->IsUsingHighResClock();
+ }
++
++// TimeDelta ------------------------------------------------------------------
++
++// static
++TimeDelta TimeDelta::FromQPCValue(LONGLONG qpc_value) {
++  return TimeDelta(
++      HighResNowSingleton::GetInstance()->QPCValueToMicroseconds(qpc_value));
++}
+--- chrome/renderer/render_thread.cc~	2012-12-13 07:04:19.146953912 -0600
++++ chrome/renderer/render_thread.cc	2012-12-17 08:47:04.266875964 -0600
+@@ -1084,7 +1084,7 @@
+   // to free everything possible in just one pass.
+   while (!v8::V8::IdleNotification()) {
+   }
+-
++  v8::V8::LowMemoryNotification();
+ #if (defined(OS_WIN) || defined(OS_LINUX)) && defined(USE_TCMALLOC)
+   // Tell tcmalloc to release any free pages it's still holding.
+   MallocExtension::instance()->ReleaseFreeMemory();
+--- webkit/glue/webkitclient_impl.cc~	2012-12-13 07:01:42.565959335 -0600
++++ webkit/glue/webkitclient_impl.cc	2012-12-18 13:41:25.205259038 -0600
+@@ -446,6 +446,11 @@
+   return base::Time::Now().ToDoubleT();
+ }
+ 
++double WebKitClientImpl::monotonicallyIncreasingTime() {
++	        return base::TimeTicks::Now().ToInternalValue() /
++				                static_cast<double>(base::Time::kMicrosecondsPerSecond);
++}
++
+ void WebKitClientImpl::cryptographicallyRandomValues(
+     unsigned char* buffer, size_t length) {
+   uint64 bytes = 0;
+@@ -461,8 +466,8 @@
+   shared_timer_func_ = func;
+ }
+ 
+-void WebKitClientImpl::setSharedTimerFireTime(double fire_time) {
+-  shared_timer_fire_time_ = fire_time;
++void WebKitClientImpl::setSharedTimerFireInterval(double fire_interval) {
++  shared_timer_fire_time_ = fire_interval + monotonicallyIncreasingTime();
+   if (shared_timer_suspended_)
+     return;
+ 
+@@ -477,7 +482,7 @@
+   // This results in measurable performance degradation unless we use ceil() to
+   // always round up the sleep times.
+   int64 interval = static_cast<int64>(
+-      ceil((fire_time - currentTime()) * base::Time::kMicrosecondsPerSecond));
++      ceil((fire_interval * base::Time::kMillisecondsPerSecond) * base::Time::kMicrosecondsPerMillisecond));
+   if (interval < 0)
+     interval = 0;
+ 
+@@ -596,7 +601,7 @@
+ void WebKitClientImpl::ResumeSharedTimer() {
+   // The shared timer may have fired or been adjusted while we were suspended.
+   if (--shared_timer_suspended_ == 0 && !shared_timer_.IsRunning())
+-    setSharedTimerFireTime(shared_timer_fire_time_);
++    setSharedTimerFireInterval(monotonicallyIncreasingTime() - shared_timer_fire_time_);
+ }
+ 
+ }  // namespace webkit_glue
+--- webkit/glue/webkitclient_impl.h~	2012-12-13 07:01:42.583959334 -0600
++++ webkit/glue/webkitclient_impl.h	2012-12-18 13:32:47.058277011 -0600
+@@ -68,10 +68,11 @@
+       const WebKit::WebString& value1, const WebKit::WebString& value2);
+   virtual void suddenTerminationChanged(bool enabled) { }
+   virtual double currentTime();
++  virtual double monotonicallyIncreasingTime();
+   virtual void cryptographicallyRandomValues(
+       unsigned char* buffer, size_t length);
+   virtual void setSharedTimerFiredFunction(void (*func)());
+-  virtual void setSharedTimerFireTime(double fireTime);
++  virtual void setSharedTimerFireInterval(double fireInterval);
+   virtual void stopSharedTimer();
+   virtual void callOnMainThread(void (*func)(void*), void* context);
+ 

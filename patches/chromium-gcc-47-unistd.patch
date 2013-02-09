@@ -59,17 +59,18 @@ Index: base/time_posix.cc
 ===================================================================
 --- base/time_posix.cc	(revision 87952)
 +++ base/time_posix.cc	(working copy)
-@@ -12,6 +12,10 @@
- #include "base/basictypes.h"
- #include "base/logging.h"
+@@ -12,6 +12,11 @@
  
-+#if defined(OS_POSIX)
-+#include <unistd.h>
+ #include <sys/time.h>
+ #include <time.h>
++#if defined(OS_ANDROID)
++#include <time64.h>
 +#endif
++#include <unistd.h>
 +
- namespace base {
  
- struct timespec TimeDelta::ToTimeSpec() const {
+ #include <limits>
+ 
 Index: base/platform_file_posix.cc
 ===================================================================
 --- base/platform_file_posix.cc	(revision 87952)
