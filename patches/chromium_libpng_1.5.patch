@@ -11,10 +11,10 @@ Index: third_party/WebKit/Source/WebCore/platform/image-encoders/skia/PNGImageEn
  }
  
  static void preMultipliedBGRAtoRGBA(const SkPMColor* input, int pixels, unsigned char* output)
-Index: /home/matt/src/berkelium/build/chromium/src/third_party/WebKit/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp
+Index: third_party/WebKit/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp
 ===================================================================
---- /home/matt/src/berkelium/build/chromium/src/third_party/WebKit/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp	(revision 86868)
-+++ /home/matt/src/berkelium/build/chromium/src/third_party/WebKit/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp	(working copy)
+--- third_party/WebKit/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp	(revision 86868)
++++ third_party/WebKit/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp	(working copy)
 @@ -228,7 +228,11 @@
      int compressionType;
      char* profile;
