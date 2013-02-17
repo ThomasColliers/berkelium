@@ -230,8 +230,9 @@ if [ x"${platform}" = x"Darwin" ]; then
     mkdir -p "${CHROMIUM_BUILD_DIR}"
     cd "${CHROMIUM_BUILD_DIR}"
     if [ \! -e depot_tools ]; then
-        curl -o depot_tools.tar.gz http://src.chromium.org/svn/trunk/tools/depot_tools.tar.gz
-        tar -zxf depot_tools.tar.gz
+        curl -o depot_tools.zip http://src.chromium.org/svn/trunk/tools/depot_tools.zip
+        unzip depot_tools.zip
+        chmod -R a+x depot_tools/
     fi
     PATH="${CHROMIUM_DEPOTTOOLS_DIR}:$PATH"
     echo "${CHROMIUM_CHECKOUT_DIR}"
