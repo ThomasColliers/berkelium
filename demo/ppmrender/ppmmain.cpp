@@ -43,6 +43,7 @@
 #include <windows.h>
 #else
 #include <sys/select.h>
+#include <unistd.h>
 #endif
 #include <sstream>
 #include <iostream>
